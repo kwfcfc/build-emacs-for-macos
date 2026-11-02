@@ -119,15 +119,29 @@ Or you can run the build script via `nix develop`:
 nix develop --command ./build-emacs-for-macos --help
 ```
 
-The Nix environment defaults to targeting the macOS 11 SDK, which makes Emacs
-builds compatible with macOS 11.3 or later. You can easily target later macOS
-SDKs. Versions 11 to 15 are available. For example, to target the macOS 12 SDK,
-run `nix develop .#macos12`
+The Nix environment defaults to targeting the macOS 26 SDK. SDK versions 14,
+15, and 26 are available. For example, to target the macOS 15 SDK,
+run `nix develop .#macos15`.
 
-The build selects Tree-sitter 0.25.x for Emacs 29 and 30, and Tree-sitter
-0.27.x for Emacs 31 and later. Both versions are built with the pinned Nixpkgs
-25.05 Darwin toolchain so their bundled libraries remain compatible with
-macOS 11.3 and later.
+The Nix build uses the packaged Tree-sitter runtime for Emacs 29 and 30,
+and a project-local Tree-sitter 0.27.x runtime for Emacs 31 and later.
+The toolchain is pinned to Nixpkgs 26.05.
+Its dependencies target macOS 14 or later; macOS 11–13 SDK shells are no
+longer supported.
+
+To build `feature/igc3` with incremental garbage collection, full native AOT
+compilation, and parallel compilation for macOS 26:
+
+```bash
+nix develop .#macos26 --command ./build-emacs-for-macos \
+  --work-dir "$PWD/builds/igc-nix2605" --build-name Emacs-IGC \
+  --mps --native-comp --native-full-aot --parallel 10 --no-archive feature/igc3
+```
+
+Use a fresh work directory when changing toolchains or configure options.
+The `--mps` option is required: IGC branches otherwise build with the standard
+garbage collector. The resulting bundle is named `Emacs.app` inside the build
+directory and can be renamed to `Emacs-IGC.app` for installation.
 
 ### Homebrew
 
@@ -152,6 +166,7 @@ Options:
         --[no-]use-nix               Use Nix instead of Homebrew to find dependencies (default: enabled if IN_NIX_SHELL is set)
         --[no-]tree-sitter           Enable/disable tree-sitter if supported (default: enabled)
         --[no-]native-comp           Enable/disable native-comp (default: enabled if supported)
+        --mps                       Enable incremental garbage collection via MPS (IGC branches only)
         --optimize                   Shorthand for --native-march --native-mtune --fomit-frame-pointer (default: disabled)
         --[no-]native-march          Enable/disable -march=native CFLAG (default: disabled)
         --[no-]native-mtune          Enable/disable -mtune=native CFLAG (default: disabled)

@@ -1,0 +1,813 @@
+#!/usr/bin/env bash
+#
+# Build, verify, package, and install Emacs-IGC.app from the feature/igc3
+# branch of emacs-mirror/emacs. Each check guards against a failure seen in an
+# earlier build; the comments next to them explain which.
+# .github/workflows/emacs-igc.yml runs the build and dmg commands on CI.
+#
+# Compatible with macOS /bin/bash 3.2.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+PROG=${0##*/}
+
+IGC_GITHUB_REPO=${IGC_GITHUB_REPO:-emacs-mirror/emacs}
+IGC_BRANCH=${IGC_BRANCH:-feature/igc3}
+IGC_NIX_SHELL=${IGC_NIX_SHELL:-.#macos26}
+IGC_JOBS=${IGC_JOBS:-$(sysctl -n hw.logicalcpu)}
+IGC_INSTALL_PATH=${IGC_INSTALL_PATH:-/Applications/Emacs-IGC.app}
+IGC_WORK_ROOT=${IGC_WORK_ROOT:-$REPO_ROOT/builds}
+IGC_BACKUP_DIR=${IGC_BACKUP_DIR:-$IGC_WORK_ROOT/igc-backups}
+IGC_KEEP_BACKUPS=${IGC_KEEP_BACKUPS:-2}
+IGC_ELN_CACHE=${IGC_ELN_CACHE:-}
+IGC_LAUNCH_AGENTS_DIR=${IGC_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}
+
+APP_NAME=Emacs-IGC
+BUNDLE_ID=org.gnu.Emacs-IGC
+COMMIT_MARKER=Contents/Resources/igc-source-commit.txt
+BUILD_OPTIONS=(--mps --native-comp --native-full-aot --no-archive)
+CLEAN_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+ASSUME_YES=false
+FORCE=false
+STOPPED_AGENTS=()
+DMG_MOUNT=''
+
+usage() {
+  cat <<EOF
+Usage: scripts/igc/$PROG [-y] [-f] COMMAND [ARGS]
+
+Commands:
+  check              Compare the installed commit with the upstream branch head
+  update             check, build, install and clean in one go
+  preflight [SHA]    Check the toolchain and patch URLs without building
+  build [SHA]        Build, package and verify SHA (default: upstream head)
+  verify [APP]       Signature, batch and library checks (default: installed app)
+  gui-test [APP]     Open APP with -Q and confirm a Cocoa frame starts
+  dmg [APP] [OUT]    Pack a packaged APP (default: newest build) into a disk
+                     image (default: <work dir>/Emacs-IGC-<sha7>.dmg)
+  install [APP|SHA|DMG]
+                     Stop running Emacs-IGC processes and launchd agents (after
+                     confirming), back up, install, verify, restart the agents.
+                     A DMG (e.g. from the GitHub Actions build) is mounted first
+  rollback [BACKUP]  Restore the newest (or given) backup the same way
+  eln-clean          Move eln-cache directories of older builds to the Trash
+  clean [--all]      Delete build intermediates (--all: old work dirs) and
+                     backups beyond IGC_KEEP_BACKUPS
+
+Options:
+  -y, --yes          Answer yes to every confirmation prompt
+  -f, --force        Let update rebuild even when the installed commit is current
+  -h, --help         Show this help
+
+Environment (defaults):
+  IGC_BRANCH=$IGC_BRANCH  IGC_GITHUB_REPO=$IGC_GITHUB_REPO
+  IGC_NIX_SHELL=$IGC_NIX_SHELL  IGC_JOBS=$IGC_JOBS
+  IGC_INSTALL_PATH=$IGC_INSTALL_PATH
+  IGC_WORK_ROOT=$IGC_WORK_ROOT
+  IGC_BACKUP_DIR=$IGC_BACKUP_DIR  IGC_KEEP_BACKUPS=$IGC_KEEP_BACKUPS
+  IGC_ELN_CACHE (detected from your early-init.el when unset)
+EOF
+}
+
+log() { printf '==> %s\n' "$*" >&2; }
+warn() { printf '==> WARN: %s\n' "$*" >&2; }
+die() {
+  printf '==> ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+confirm() {
+  if $ASSUME_YES; then
+    return 0
+  fi
+  local reply
+  read -r -p "$1 [y/N] " reply </dev/tty || return 1
+  [[ $reply == [yY]* ]]
+}
+
+in_nix() {
+  (cd "$REPO_ROOT" && nix develop "$IGC_NIX_SHELL" --command "$@")
+}
+
+# Run outside Nix and without inherited DYLD/Nix variables, so a bundle that
+# still depends on /nix/store or a missing library fails here, not later.
+clean_env() {
+  env -i PATH="$CLEAN_PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" "$@"
+}
+
+upstream_sha() {
+  local sha
+  sha=$(git ls-remote "https://github.com/$IGC_GITHUB_REPO.git" \
+    "refs/heads/$IGC_BRANCH" | cut -f1)
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] ||
+    die "Could not resolve $IGC_BRANCH on $IGC_GITHUB_REPO"
+  printf '%s\n' "$sha"
+}
+
+# emacs-repository-version reports this builder repo's HEAD, not the Emacs
+# source, so the commit marker written at packaging time is authoritative.
+app_sha() {
+  if [[ -f $1/$COMMIT_MARKER ]]; then
+    tr -d '[:space:]' <"$1/$COMMIT_MARKER"
+  fi
+}
+
+resolve_sha() {
+  local sha=${1:-}
+  if [[ -z $sha ]]; then
+    sha=$(upstream_sha)
+  fi
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] ||
+    die "Expected a full 40-character commit SHA: $sha"
+  printf '%s\n' "$sha"
+}
+
+attach_dmg() {
+  DMG_MOUNT=$(mktemp -d -t emacs-igc-dmg)
+  trap detach_dmg EXIT
+  hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$DMG_MOUNT" \
+    "$1" >/dev/null || die "Could not mount $1"
+}
+
+# Also runs from the EXIT trap, so a failed install never leaves the image
+# mounted.
+detach_dmg() {
+  if [[ -n $DMG_MOUNT ]]; then
+    hdiutil detach -quiet "$DMG_MOUNT" >/dev/null 2>&1 ||
+      hdiutil detach -force -quiet "$DMG_MOUNT" >/dev/null 2>&1 || true
+    rmdir "$DMG_MOUNT" 2>/dev/null || true
+    DMG_MOUNT=''
+  fi
+}
+
+work_dir_for() { printf '%s/igc-%s\n' "$IGC_WORK_ROOT" "${1:0:7}"; }
+output_dir_for() { printf '%s/builds/%s\n' "$(work_dir_for "$1")" "$APP_NAME"; }
+app_for() { printf '%s/%s.app\n' "$(output_dir_for "$1")" "$APP_NAME"; }
+
+newest() {
+  local path latest=
+  for path in "$@"; do
+    if [[ -e $path && (-z $latest || $path -nt $latest) ]]; then
+      latest=$path
+    fi
+  done
+  printf '%s' "$latest"
+}
+
+# Backups are named Emacs-IGC-<sha7>-<YYYYmmdd>-<HHMMSS>.app; sort on the
+# timestamp because mv and ditto keep the bundle's original mtime.
+backups_newest_first() {
+  local path
+  for path in "$IGC_BACKUP_DIR/$APP_NAME"-*.app; do
+    if [[ -d $path && $path != *.failed.app ]]; then
+      printf '%s\n' "${path##*/}"
+    fi
+  done | sort -t- -k4,5r | sed "s|^|$IGC_BACKUP_DIR/|"
+}
+
+backup_path() {
+  local tag=${1:0:7} path
+  # mv into an existing directory would nest the app inside it.
+  while :; do
+    path=$(printf '%s/%s-%s-%s%s.app' "$IGC_BACKUP_DIR" "$APP_NAME" \
+      "${tag:-unknown}" "$(date +%Y%m%d-%H%M%S)" "${2:-}")
+    if [[ ! -e $path ]]; then
+      break
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$path"
+}
+
+running_pids() {
+  pgrep -f "^$IGC_INSTALL_PATH/Contents/MacOS/Emacs" || true
+}
+
+server_eval() {
+  "$IGC_INSTALL_PATH/Contents/MacOS/bin/emacsclient" -w 5 -e "$1" 2>/dev/null ||
+    true
+}
+
+# LaunchAgents whose program lives inside the installed app, such as an
+# `Emacs --fg-daemon` service.
+launch_agents() {
+  local plist program
+  for plist in "$IGC_LAUNCH_AGENTS_DIR"/*.plist; do
+    program=$(plutil -extract ProgramArguments.0 raw -o - "$plist" 2>/dev/null ||
+      true)
+    if [[ $program == "$IGC_INSTALL_PATH"/* ]]; then
+      printf '%s\n' "$plist"
+    fi
+  done
+}
+
+restart_agents() {
+  local plist
+  for plist in ${STOPPED_AGENTS[@]+"${STOPPED_AGENTS[@]}"}; do
+    log "Restarting launchd agent $(plutil -extract Label raw -o - "$plist")"
+    launchctl bootstrap "gui/$UID" "$plist" ||
+      warn "Could not restart it; run: launchctl bootstrap gui/$UID $plist"
+  done
+  STOPPED_AGENTS=()
+}
+
+# A running Emacs keeps loading .eln and .elc files from the bundle by path,
+# so every process must stop before the bundle is replaced.
+stop_emacs() {
+  local pids server_pid unsaved plist label _
+  pids=$(running_pids)
+  if [[ -z $pids ]]; then
+    return 0
+  fi
+  log "$APP_NAME is running:"
+  ps -o pid,command -p "$(paste -sd, - <<<"$pids")" >&2
+
+  # Only the daemon that owns the server socket can be asked about buffers,
+  # and the socket may belong to another Emacs, so check its pid first.
+  server_pid=$(server_eval '(emacs-pid)')
+  if ! grep -qx "$server_pid" <<<"$pids"; then
+    server_pid=''
+  fi
+  if [[ -n $server_pid ]]; then
+    unsaved=$(server_eval '(mapconcat (function buffer-name)
+  (seq-filter (lambda (b) (and (buffer-file-name b) (buffer-modified-p b)))
+              (buffer-list))
+  " ")')
+    unsaved=${unsaved//\"/}
+    [[ -z $unsaved ]] ||
+      die "Unsaved file buffers in the Emacs server: $unsaved. Save them, then rerun."
+  fi
+  confirm "Stop these processes? Non-file buffers such as *scratch* are lost; launchd agents restart afterwards." ||
+    die "Quit $APP_NAME (GUI and daemons), then rerun."
+
+  # Boot agents out first: KeepAlive restarts a daemon that exits cleanly.
+  while IFS= read -r plist; do
+    label=$(plutil -extract Label raw -o - "$plist")
+    if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+      log "Stopping launchd agent $label"
+      launchctl bootout "gui/$UID/$label" || warn "launchctl bootout $label failed"
+      STOPPED_AGENTS+=("$plist")
+    fi
+  done < <(launch_agents)
+
+  if [[ -n $server_pid ]]; then
+    server_eval '(kill-emacs)' >/dev/null
+  fi
+  pids=$(running_pids)
+  if [[ -n $pids ]]; then
+    log "Sending SIGTERM to $(paste -sd' ' - <<<"$pids")"
+    xargs kill <<<"$pids" 2>/dev/null || true
+  fi
+  for _ in {1..20}; do
+    if [[ -z $(running_pids) ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  restart_agents
+  die "$APP_NAME is still running ($(running_pids | paste -sd' ' -)); quit it and rerun."
+}
+
+batch_verify() {
+  local app=$1
+  log "Checking the code signature of $app"
+  codesign --verify --deep --strict "$app" || return 1
+  log "Running batch checks in a clean environment"
+  clean_env "$app/Contents/MacOS/Emacs" -Q --batch \
+    -l "$SCRIPT_DIR/verify.el" || return 1
+}
+
+gui_check() {
+  local app=$1 result _
+  result=$(mktemp -t emacs-igc-gui) || return 1
+  rm -f "$result"
+  log "Opening $app with -Q to check the Cocoa GUI"
+  open -n "$app" --args -Q \
+    --eval "(setq emacs-igc-gui-output \"$result\")" \
+    -l "$SCRIPT_DIR/gui-verify.el" || return 1
+  for _ in {1..60}; do
+    if [[ -s $result ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ ! -s $result ]]; then
+    warn "No GUI result after 60 seconds"
+    return 1
+  fi
+  cat "$result" >&2
+  grep -q '^Cocoa GUI: OK' "$result" || return 1
+  rm -f "$result"
+}
+
+audit_bundle() {
+  local app=$1 report=$2
+  log "Auditing bundled libraries"
+  if ! in_nix ruby "$SCRIPT_DIR/audit_bundle.rb" "$app" >"$report"; then
+    cat "$report" >&2
+    die "Unresolved library dependencies in $app (report: $report)"
+  fi
+  log "All dependencies resolve across" \
+    "$(plutil -extract macho_files raw -o - "$report") Mach-O files"
+}
+
+upstream_tests() {
+  local app=$1 work=$2 tests
+  tests=$(newest "$work"/sources/*/test/src/igc-tests.el)
+  if [[ -z $tests ]]; then
+    log "Skipping upstream IGC tests (no source tree in $work)"
+    return 0
+  fi
+  log "Running upstream IGC tests"
+  clean_env "$app/Contents/MacOS/Emacs" -Q --batch -l "$tests" \
+    --eval "(ert-run-tests-batch-and-exit '(not (tag :expensive-test)))" ||
+    die "Upstream IGC tests failed"
+}
+
+verify_build() {
+  local app=$1 work=$2
+  batch_verify "$app" || die "Batch checks failed for $app"
+  audit_bundle "$app" "$work/bundle-audit.json"
+  upstream_tests "$app" "$work"
+}
+
+package_app() {
+  local raw=$1 app=$2 sha=$3
+  local plist=$app/Contents/Info.plist
+  log "Packaging $app"
+  mv "$raw" "$app"
+  plutil -replace CFBundleName -string "$APP_NAME" "$plist"
+  plutil -replace CFBundleDisplayName -string "$APP_NAME" "$plist"
+  plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$plist"
+  printf '%s\n' "$sha" >"$app/$COMMIT_MARKER"
+  # The plist edits and the marker invalidate the build script's signature.
+  codesign --force --deep -s - "$app"
+}
+
+write_manifest() {
+  local app=$1 work=$2 sha=$3 dirty=false
+  if [[ -n $(git -C "$REPO_ROOT" status --porcelain -- \
+    build-emacs-for-macos flake.nix flake.lock) ]]; then
+    dirty=true
+  fi
+  cat >"$work/build-manifest.json" <<EOF
+{
+  "application": "$app",
+  "repository": "https://github.com/$IGC_GITHUB_REPO",
+  "branch": "$IGC_BRANCH",
+  "commit": "$sha",
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "builder_commit": "$(git -C "$REPO_ROOT" rev-parse HEAD)",
+  "builder_uncommitted_changes": $dirty,
+  "nixpkgs": "$(plutil -extract nodes.nixpkgs.locked.rev raw -o - "$REPO_ROOT/flake.lock")",
+  "nix_shell": "$IGC_NIX_SHELL",
+  "build_options": "${BUILD_OPTIONS[*]} --parallel $IGC_JOBS",
+  "bundled_eln_files": $(find "$app" -name '*.eln' | wc -l | tr -d ' ')
+}
+EOF
+}
+
+diagnose_failure() {
+  local work=$1
+  local build_log=$work/build.log
+  if grep -q "Can't exec \"aclocal\"" "$build_log"; then
+    warn "autoreconf needs automake; add automake to the flake packages."
+  fi
+  if grep -q "required function 'tputs' was not found" "$build_log"; then
+    warn "The Nix linker rejected $work/sdk-stubs/libncurses.tbd." \
+      "Look for unsupported targets (such as arm64e.x1) in it and in" \
+      "nix_system_library_stub_dir."
+  fi
+  if grep -q 'curl: (22)' "$build_log"; then
+    warn "A patch download failed; run '$PROG preflight' and update build_patches."
+  fi
+  if grep -Eq 'Hunk #[0-9]+ FAILED|saving rejects' "$build_log"; then
+    warn "A patch no longer applies to this commit; it may need a date gate" \
+      "in build_patches."
+  fi
+}
+
+report_status() {
+  local installed=$1 upstream=$2 ahead
+  printf 'Installed: %s\n' "${installed:-unknown (no $COMMIT_MARKER)}"
+  printf 'Upstream:  %s (%s)\n' "$upstream" "$IGC_BRANCH"
+  if [[ $installed == "$upstream" ]]; then
+    printf 'Status:    up to date\n'
+  elif [[ -n $installed ]]; then
+    ahead=$(curl -fsS "https://api.github.com/repos/$IGC_GITHUB_REPO/compare/$installed...$upstream?per_page=1" 2>/dev/null |
+      plutil -extract ahead_by raw -o - - 2>/dev/null || true)
+    printf 'Status:    update available%s\n' "${ahead:+ ($ahead commits)}"
+    printf 'Changes:   https://github.com/%s/compare/%s...%s\n' \
+      "$IGC_GITHUB_REPO" "${installed:0:12}" "${upstream:0:12}"
+  else
+    printf 'Status:    installed commit unknown\n'
+  fi
+}
+
+cmd_check() {
+  local installed upstream
+  installed=$(app_sha "$IGC_INSTALL_PATH")
+  upstream=$(upstream_sha)
+  report_status "$installed" "$upstream"
+}
+
+cmd_preflight() {
+  local sha work
+  sha=$(resolve_sha "${1:-}")
+  work=$(work_dir_for "$sha")
+  [[ $(uname -sm) == "Darwin arm64" ]] ||
+    die "This workflow targets Apple Silicon macOS"
+  command -v nix >/dev/null || die "nix is not installed"
+  grep -q 'options\[:mps\]' "$REPO_ROOT/build-emacs-for-macos" ||
+    die "build-emacs-for-macos has no --mps option; check out a branch" \
+      "that carries the IGC build changes"
+  log "Checking Ruby gems in $IGC_NIX_SHELL"
+  in_nix bash -c 'bundle check >/dev/null || bundle install'
+  log "Checking the patches for ${sha:0:7}"
+  in_nix ruby "$SCRIPT_DIR/check_patches.rb" \
+    "$REPO_ROOT/build-emacs-for-macos" "$IGC_BRANCH" \
+    --github-src-repo "$IGC_GITHUB_REPO" --git-sha "$sha" \
+    --work-dir "$work" "${BUILD_OPTIONS[@]}" ||
+    die "Some patches are unavailable. Compare build_patches with upstream" \
+      "jimeh/build-emacs-for-macos: patches that emacs-plus removed or" \
+      "changed need a date gate on meta[:date]."
+}
+
+cmd_build() {
+  local sha work out raw app stale
+  sha=$(resolve_sha "${1:-}")
+  work=$(work_dir_for "$sha")
+  out=$(output_dir_for "$sha")
+  raw=$out/Emacs.app
+  app=$(app_for "$sha")
+
+  if [[ -d $app && $(app_sha "$app") == "$sha" ]]; then
+    log "Already packaged: $app (delete $work to rebuild)"
+    verify_build "$app" "$work"
+    return 0
+  fi
+
+  cmd_preflight "$sha"
+  mkdir -p "$work"
+  # build-emacs-for-macos refuses to overwrite an existing output directory.
+  if [[ -e $out ]]; then
+    stale=$out.stale-$(date +%Y%m%d-%H%M%S)
+    warn "Moving the previous output aside to $stale"
+    mv "$out" "$stale"
+  fi
+
+  log "Building ${sha:0:7} with $IGC_JOBS jobs; log: $work/build.log"
+  if ! in_nix ./build-emacs-for-macos \
+    --github-src-repo "$IGC_GITHUB_REPO" --git-sha "$sha" \
+    --work-dir "$work" --build-name "$APP_NAME" --parallel "$IGC_JOBS" \
+    "${BUILD_OPTIONS[@]}" "$IGC_BRANCH" 2>&1 | tee -a "$work/build.log"; then
+    diagnose_failure "$work"
+    die "Build failed; see $work/build.log"
+  fi
+  # Never package a build that did not produce an app.
+  [[ -x $raw/Contents/MacOS/Emacs ]] ||
+    die "The build exited successfully but $raw is missing"
+
+  package_app "$raw" "$app" "$sha"
+  verify_build "$app" "$work"
+  write_manifest "$app" "$work" "$sha"
+  log "Ready to install: $app"
+}
+
+cmd_verify() {
+  local app=${1:-$IGC_INSTALL_PATH} report
+  [[ -x $app/Contents/MacOS/Emacs ]] || die "No Emacs executable in $app"
+  batch_verify "$app" || die "Batch checks failed for $app"
+  report=$(mktemp -t emacs-igc-audit)
+  audit_bundle "$app" "$report"
+  rm -f "$report"
+  log "Commit: $(app_sha "$app")"
+}
+
+cmd_gui_test() {
+  gui_check "${1:-$IGC_INSTALL_PATH}" || die "GUI check failed"
+}
+
+newest_packaged_app() {
+  local app
+  app=$(newest "$IGC_WORK_ROOT"/igc-*/builds/"$APP_NAME/$APP_NAME".app)
+  [[ -n $app ]] || die "No packaged build found; run '$PROG build' first"
+  printf '%s\n' "$app"
+}
+
+# A compressed read-only image holding the app and an /Applications link, so
+# a build made elsewhere (such as GitHub Actions) can be shipped as one file.
+# Prints the image path on stdout.
+cmd_dmg() {
+  local app=${1:-} out=${2:-} sha stage attempt ok=false
+  if [[ -z $app ]]; then
+    app=$(newest_packaged_app)
+  fi
+  app=${app%/}
+  [[ -x $app/Contents/MacOS/Emacs ]] || die "No Emacs executable in $app"
+  sha=$(app_sha "$app")
+  [[ -n $sha ]] ||
+    die "$app has no $COMMIT_MARKER; package it with '$PROG build' first"
+  if [[ -z $out ]]; then
+    out=$(work_dir_for "$sha")/$APP_NAME-${sha:0:7}.dmg
+  fi
+  [[ ! -e $out ]] || die "$out already exists"
+  codesign --verify --deep --strict "$app" ||
+    die "$app has an invalid code signature"
+
+  stage=$(mktemp -d -t emacs-igc-stage)
+  ditto "$app" "$stage/$APP_NAME.app"
+  ln -s /Applications "$stage/Applications"
+  mkdir -p "$(dirname "$out")"
+  log "Creating $out"
+  # hdiutil create fails now and then with "Resource busy" on CI runners.
+  for attempt in 1 2 3; do
+    if hdiutil create -volname "$APP_NAME ${sha:0:7}" -srcfolder "$stage" \
+      -format ULMO -ov "$out" >&2; then
+      ok=true
+      break
+    fi
+    warn "hdiutil create failed (attempt $attempt of 3)"
+    sleep 5
+  done
+  # rm does not follow the /Applications symlink.
+  rm -rf "$stage"
+  $ok || die "Could not create $out"
+
+  log "Checking the app inside the image"
+  attach_dmg "$out"
+  codesign --verify --deep --strict "$DMG_MOUNT/$APP_NAME.app" ||
+    die "The app in $out has an invalid code signature"
+  [[ $(app_sha "$DMG_MOUNT/$APP_NAME.app") == "$sha" ]] ||
+    die "The app in $out does not carry commit $sha"
+  detach_dmg
+  printf '%s\n' "$out"
+}
+
+install_from_dmg() {
+  local dmg=$1
+  [[ -f $dmg ]] || die "Not found: $dmg"
+  # Browsers quarantine downloads; the flag carries over to the installed app
+  # and Gatekeeper then blocks this ad-hoc signed build at the GUI check.
+  if xattr -p com.apple.quarantine "$dmg" >/dev/null 2>&1; then
+    die "$dmg is quarantined (downloaded through a browser). Download it" \
+      "with 'gh release download' instead, or, if you trust where it came" \
+      "from, run: xattr -d com.apple.quarantine '$dmg'"
+  fi
+  log "Mounting $dmg"
+  attach_dmg "$dmg"
+  [[ -d $DMG_MOUNT/$APP_NAME.app ]] || die "$dmg contains no $APP_NAME.app"
+  cmd_install "$DMG_MOUNT/$APP_NAME.app"
+  detach_dmg
+}
+
+cmd_install() {
+  local arg=${1:-} app sha installed backup='' failed
+  if [[ $arg == *.dmg ]]; then
+    install_from_dmg "$arg"
+    return
+  fi
+  if [[ -z $arg ]]; then
+    app=$(newest_packaged_app)
+  elif [[ $arg =~ ^[0-9a-f]{40}$ ]]; then
+    app=$(app_for "$arg")
+  else
+    app=${arg%/}
+  fi
+  [[ -d $app ]] || die "Not found: $app"
+  sha=$(app_sha "$app")
+  [[ -n $sha ]] ||
+    die "$app has no $COMMIT_MARKER; package it with '$PROG build' first"
+  [[ $app != "$IGC_INSTALL_PATH" ]] || die "$app is already installed"
+
+  installed=$(app_sha "$IGC_INSTALL_PATH")
+  confirm "Install ${sha:0:12} over ${installed:-the current app} at $IGC_INSTALL_PATH?" ||
+    die "Cancelled"
+  stop_emacs
+
+  mkdir -p "$IGC_BACKUP_DIR"
+  if [[ -e $IGC_INSTALL_PATH ]]; then
+    backup=$(backup_path "$installed")
+    log "Backing up the current app to $backup"
+    mv "$IGC_INSTALL_PATH" "$backup"
+  fi
+
+  log "Installing $app"
+  if ditto "$app" "$IGC_INSTALL_PATH" &&
+    batch_verify "$IGC_INSTALL_PATH" &&
+    gui_check "$IGC_INSTALL_PATH"; then
+    log "Installed ${sha:0:12} to $IGC_INSTALL_PATH"
+    restart_agents
+    if [[ -n $backup ]]; then
+      log "Previous app: $backup ('$PROG rollback' restores it)"
+    fi
+    log "The new build recompiles your packages into a new eln-cache" \
+      "directory on first use. Keep the old one while rollback may be needed," \
+      "then run '$PROG eln-clean'."
+    return 0
+  fi
+
+  failed=$(backup_path "$sha" .failed)
+  warn "The installed app failed verification; moving it to $failed"
+  if [[ -e $IGC_INSTALL_PATH ]]; then
+    mv "$IGC_INSTALL_PATH" "$failed"
+  fi
+  if [[ -n $backup ]]; then
+    mv "$backup" "$IGC_INSTALL_PATH"
+    warn "Restored the previous app"
+  fi
+  restart_agents
+  die "Installation rolled back"
+}
+
+cmd_rollback() {
+  local backup=${1:-} current
+  if [[ -z $backup ]]; then
+    backup=$(backups_newest_first | head -n 1)
+  fi
+  backup=${backup%/}
+  [[ -n $backup && -d $backup ]] || die "No backup found in $IGC_BACKUP_DIR"
+
+  confirm "Restore ${backup##*/} to $IGC_INSTALL_PATH?" || die "Cancelled"
+  stop_emacs
+  if [[ -e $IGC_INSTALL_PATH ]]; then
+    current=$(backup_path "$(app_sha "$IGC_INSTALL_PATH")")
+    log "Moving the current app to $current"
+    mv "$IGC_INSTALL_PATH" "$current"
+  fi
+  mv "$backup" "$IGC_INSTALL_PATH"
+  batch_verify "$IGC_INSTALL_PATH" ||
+    die "The restored app failed batch checks; launchd agents were not restarted"
+  restart_agents
+  log "Restored $(app_sha "$IGC_INSTALL_PATH")"
+}
+
+detect_eln_cache() {
+  # Load early-init.el the way a normal startup would, since it may call
+  # startup-redirect-eln-cache.
+  "$IGC_INSTALL_PATH/Contents/MacOS/Emacs" -Q --batch --eval '
+(let ((early (expand-file-name "early-init.el" user-emacs-directory)))
+  (when (file-exists-p early)
+    (condition-case nil (load early nil t) (error nil)))
+  (princ (car native-comp-eln-load-path)))' 2>/dev/null || true
+}
+
+cmd_eln_clean() {
+  local keep cache prefix dir stale=()
+  keep=$(newest "$IGC_INSTALL_PATH"/Contents/Frameworks/native-lisp/*/)
+  [[ -n $keep ]] || die "No bundled native-lisp directory in $IGC_INSTALL_PATH"
+  keep=$(basename "$keep")
+  prefix=${keep%-*}-
+  cache=${IGC_ELN_CACHE:-$(detect_eln_cache)}
+  cache=${cache%/}
+  [[ -n $cache ]] || die "Could not detect the eln cache; set IGC_ELN_CACHE"
+  [[ $cache != *.app/* ]] ||
+    die "Refusing to clean an eln cache inside an app bundle: $cache"
+  if [[ ! -d $cache ]]; then
+    log "No eln cache at $cache"
+    return 0
+  fi
+
+  # Only touch directories for this Emacs version; other installs may share
+  # the cache.
+  for dir in "$cache/$prefix"*/; do
+    dir=${dir%/}
+    if [[ -d $dir && ${dir##*/} != "$keep" ]]; then
+      stale+=("$dir")
+    fi
+  done
+  if ((${#stale[@]} == 0)); then
+    log "No stale eln-cache directories (current build: $keep)"
+    return 0
+  fi
+
+  log "The installed build uses $cache/$keep. Directories from older builds:"
+  du -sh "${stale[@]}" >&2
+  if ! confirm "Move them to the Trash?"; then
+    log "Kept them"
+    return 0
+  fi
+  for dir in "${stale[@]}"; do
+    mv "$dir" "$HOME/.Trash/eln-cache-${dir##*/}-$(date +%Y%m%d-%H%M%S)"
+  done
+  log "Moved ${#stale[@]} directories to the Trash"
+}
+
+cmd_clean() {
+  local all=false installed path name sub count=0 targets=()
+  if [[ ${1:-} == --all ]]; then
+    all=true
+  fi
+  installed=$(app_sha "$IGC_INSTALL_PATH")
+
+  # Only work directories created by this script (igc-<sha7>).
+  for path in "$IGC_WORK_ROOT"/igc-*; do
+    name=${path##*/}
+    if [[ ! -d $path || ! $name =~ ^igc-[0-9a-f]{7}$ ]]; then
+      continue
+    fi
+    if $all && [[ $name != "igc-${installed:0:7}" ]]; then
+      targets+=("$path")
+      continue
+    fi
+    for sub in "$path/sources" "$path/tarballs" "$path/sdk-stubs" \
+      "$path/builds/$APP_NAME".stale-*; do
+      if [[ -e $sub ]]; then
+        targets+=("$sub")
+      fi
+    done
+  done
+
+  for path in "$IGC_BACKUP_DIR/$APP_NAME"-*.failed.app; do
+    if [[ -e $path ]]; then
+      targets+=("$path")
+    fi
+  done
+  while IFS= read -r path; do
+    count=$((count + 1))
+    if ((count > IGC_KEEP_BACKUPS)); then
+      targets+=("$path")
+    fi
+  done < <(backups_newest_first)
+
+  if ((${#targets[@]} == 0)); then
+    log "Nothing to clean"
+    return 0
+  fi
+  log "Will delete:"
+  du -sh "${targets[@]}" >&2
+  if ! confirm "Delete these paths?"; then
+    log "Kept everything"
+    return 0
+  fi
+  for path in "${targets[@]}"; do
+    case $path in
+    "$IGC_WORK_ROOT"/igc-* | "$IGC_BACKUP_DIR"/*) rm -rf -- "$path" ;;
+    *) die "Refusing to delete an unexpected path: $path" ;;
+    esac
+  done
+  log "Deleted ${#targets[@]} paths"
+}
+
+cmd_update() {
+  local installed upstream
+  installed=$(app_sha "$IGC_INSTALL_PATH")
+  upstream=$(upstream_sha)
+  report_status "$installed" "$upstream"
+  if [[ $installed == "$upstream" ]] && ! $FORCE; then
+    log "Nothing to do (use -f to rebuild anyway)"
+    return 0
+  fi
+  cmd_build "$upstream"
+  cmd_install "$(app_for "$upstream")"
+  # eln-clean waits until the new build has proved itself: rollback reuses
+  # the old build's eln-cache directory.
+  cmd_clean
+}
+
+main() {
+  local command='' args=()
+  while (($#)); do
+    case $1 in
+    -y | --yes) ASSUME_YES=true ;;
+    -f | --force) FORCE=true ;;
+    -h | --help)
+      usage
+      return 0
+      ;;
+    *)
+      if [[ -z $command ]]; then
+        command=$1
+      else
+        args+=("$1")
+      fi
+      ;;
+    esac
+    shift
+  done
+
+  # ${args[@]+...} keeps bash 3.2 happy with an empty array under set -u.
+  case $command in
+  check) cmd_check ;;
+  update) cmd_update ;;
+  preflight) cmd_preflight ${args[@]+"${args[@]}"} ;;
+  build) cmd_build ${args[@]+"${args[@]}"} ;;
+  verify) cmd_verify ${args[@]+"${args[@]}"} ;;
+  gui-test) cmd_gui_test ${args[@]+"${args[@]}"} ;;
+  dmg) cmd_dmg ${args[@]+"${args[@]}"} ;;
+  install) cmd_install ${args[@]+"${args[@]}"} ;;
+  rollback) cmd_rollback ${args[@]+"${args[@]}"} ;;
+  eln-clean) cmd_eln_clean ;;
+  clean) cmd_clean ${args[@]+"${args[@]}"} ;;
+  "" | help) usage ;;
+  *)
+    usage >&2
+    die "Unknown command: $command"
+    ;;
+  esac
+}
+
+main "$@"

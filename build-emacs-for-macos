@@ -3,6 +3,7 @@
 
 require 'English'
 require 'date'
+require 'digest'
 require 'erb'
 require 'etc'
 require 'fileutils'
@@ -242,13 +243,13 @@ class Build
     end
     CLIHelperEmbedder.new(app).embed
     CSourcesEmbedder.new(app, @source_dir).embed
+    GccLibEmbedder.new(app, gcc_info).embed if options[:native_comp]
     LibEmbedder.new(
       app,
       [brew_dir, '/nix/store'],
       extra_libs,
       relink_eln_files: options[:relink_eln]
     ).embed
-    GccLibEmbedder.new(app, gcc_info).embed if options[:native_comp]
     embed_privacy_usage_descriptions(app)
     self_sign_app(app) if options[:self_sign]
 
@@ -634,6 +635,14 @@ class Build
     FileUtils.mkdir_p(target_dir)
 
     contents = File.read(source)
+    # New host SDKs include arm64e.x1 targets that the pinned Nix linker
+    # cannot parse. The ordinary targets retain the system ncurses exports.
+    contents = contents.gsub(/(\btargets:\s*)\[([^\]]*)\]/m) do
+      prefix = Regexp.last_match(1)
+      targets = Regexp.last_match(2).split(',').map(&:strip)
+      targets.reject! { |target| target.start_with?('arm64e.') }
+      "#{prefix}[ #{targets.join(', ')} ]"
+    end
     if host_arch == 'arm64'
       contents = contents.gsub('arm64e-macos', 'arm64-macos')
     end
@@ -767,6 +776,12 @@ class Build
         configure_flags << '--with-tree-sitter'
       end
       configure_flags << native_comp_configure_flag if options[:native_comp]
+      if options[:mps]
+        unless configure_help.match?(/\s+--with-mps(?:\s|=)/)
+          fatal 'This Emacs source tree does not support MPS garbage collection'
+        end
+        configure_flags << '--with-mps'
+      end
       configure_flags << '--without-rsvg' if options[:rsvg] == false
       configure_flags << '--without-dbus' if options[:dbus] == false
 
@@ -1684,6 +1699,12 @@ class LibEmbedder < AbstractEmbedder
 
       copy, relink = build_bundle_plan(binary)
 
+      auxiliary_macho_files.each do |file|
+        auxiliary_copy, auxiliary_relink = build_bundle_plan(file)
+        copy.concat(auxiliary_copy)
+        relink.concat(auxiliary_relink)
+      end
+
       extra_libs.each do |lib|
         extras_copy, extras_relink = build_bundle_plan(
           lib, copy_macho_file: true
@@ -1705,10 +1726,45 @@ class LibEmbedder < AbstractEmbedder
 
       bundle_libs(copy.uniq, relink.uniq)
       set_rpath(binary, rpath)
+      auxiliary_macho_files.each do |file|
+        set_rpath(file, '@loader_path')
+        set_rpath(file, File.join('@loader_path', relative_path(File.dirname(file), lib_dir)))
+      end
     end
   end
 
   private
+
+  def auxiliary_macho_files
+    @auxiliary_macho_files ||= Dir[
+      File.join(bin_dir, '**', '*'),
+      File.join(lib_dir, 'gcc', '**', '*')
+    ].select do |file|
+      next false unless File.file?(file) && !File.symlink?(file) && file != bin
+
+      begin
+        MachO.open(file).filetype != :object
+      rescue MachO::NotAMachOError
+        false
+      end
+    end
+  end
+
+  # Different providers can ship incompatible libraries with the same name
+  # (notably Apple's and GNU's libiconv). Preserve both and their callers.
+  def bundled_basename(source)
+    @bundled_names ||= {}
+    @bundled_sources ||= {}
+    @bundled_names[source] ||= begin
+      basename = File.basename(source)
+      if @bundled_sources.key?(basename) && @bundled_sources[basename] != source
+        suffix = Digest::SHA256.hexdigest(source)[0, 12]
+        basename = "#{suffix}-#{basename}"
+      end
+      @bundled_sources[basename] = source
+      basename
+    end
+  end
 
   def eln_files
     @eln_files ||= Dir[File.join(app, 'Contents', '**', '*.eln')]
@@ -1766,7 +1822,7 @@ class LibEmbedder < AbstractEmbedder
     relink_target_file = macho_file
 
     if copy_macho_file
-      macho_basename = File.basename(macho_file)
+      macho_basename = bundled_basename(macho_file)
       macho_copy_target = File.join(lib_dir, macho_basename)
       relink_target_file = macho_copy_target
       copy << {
@@ -1800,7 +1856,7 @@ class LibEmbedder < AbstractEmbedder
         next
       end
 
-      lib_basename = File.basename(lib_filepath)
+      lib_basename = bundled_basename(lib_filepath)
       copy_target = File.join(lib_dir, lib_basename)
       new_dylib_id = File.join('@rpath', lib_basename)
 
@@ -2443,6 +2499,11 @@ class CLIOptions
         'Enable/disable native-comp ' \
         '(default: enabled if supported)'
       ) { |v| options[:native_comp] = v }
+
+      opts.on(
+        '--mps',
+        'Enable incremental garbage collection via MPS (IGC branches only)'
+      ) { |v| options[:mps] = v }
 
       opts.on(
         '--optimize',

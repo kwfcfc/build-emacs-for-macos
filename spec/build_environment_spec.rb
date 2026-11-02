@@ -37,6 +37,32 @@ RSpec.describe 'Build environment' do
     end
   end
 
+  it 'removes unsupported architecture variants from SDK target lists' do
+    with_build_environment(use_nix: true) do |build, root_dir, sdk_lib_dir|
+      File.write(
+        File.join(sdk_lib_dir, 'libncurses.tbd'),
+        <<~TBD
+          --- !tapi-tbd
+          tbd-version: 4
+          targets: [ arm64e.x1-macos, x86_64-macos, arm64e-macos,
+                     arm64e.x1-maccatalyst ]
+          install-name: '/usr/lib/libncurses.5.4.dylib'
+          exports:
+            - targets: [ arm64e-macos, arm64e.x1-macos ]
+              symbols: [ _tputs ]
+        TBD
+      )
+
+      build.send(:env_LIBRARY_PATH)
+      stub = File.read(File.join(root_dir, 'sdk-stubs', 'libncurses.tbd'))
+      expect(stub).not_to include('arm64e.')
+      expect(stub).to include('targets: [ x86_64-macos, arm64-macos ]')
+      expect(stub).to include('- targets: [ arm64-macos ]')
+      expect(stub).to include("install-name: '/usr/lib/libncurses.5.4.dylib'")
+      expect(stub).to include('symbols: [ _tputs ]')
+    end
+  end
+
   it 'includes the Command Line Tools library path for non-Nix builds' do
     with_build_environment(use_nix: false) do |build, _root_dir, sdk_lib_dir|
       expect(build.send(:env_LIBRARY_PATH)).to include(sdk_lib_dir)

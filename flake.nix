@@ -2,7 +2,7 @@
   description = "Development environment flake";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -48,14 +48,11 @@
 
         # List of supported macOS SDK versions.
         sdk_versions = [
-          "11"
-          "12"
-          "13"
           "14"
           "15"
           "26"
         ];
-        default_sdk_version = "11";
+        default_sdk_version = "26";
 
         mkDevShell =
           {
@@ -72,6 +69,7 @@
             packages = with pkgs; [
               apple_sdk
               autoconf
+              automake
               bash
               cairo
               clang

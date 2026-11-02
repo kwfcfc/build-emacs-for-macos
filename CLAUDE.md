@@ -17,8 +17,8 @@ macOS Emacs building system with Ruby and Go components:
 
 ```bash
 # Environment setup (Nix preferred)
-nix develop                       # Default macOS 11 SDK
-nix develop .#macos{11-15,26}     # Target specific SDK version
+nix develop                       # Default macOS 26 SDK
+nix develop .#macos{14,15,26}     # Target specific SDK version
 
 # Go development
 make build                        # Build emacs-builder CLI
@@ -70,13 +70,12 @@ Uses `urfave/cli/v2` framework. Key packages in `pkg/`:
 
 ### Nix Environment (`flake.nix`)
 
-- Multi-SDK support: macOS 11-15, 26 via `.#macos{11,12,13,14,15,26}`
+- Multi-SDK support: macOS 14, 15, 26 via `.#macos{14,15,26}`
 - Excludes ncurses intentionally (links against system version for TUI)
 - Sets `MACOSX_DEPLOYMENT_TARGET`, `DEVELOPER_DIR`, `NIX_LIBGCCJIT_*`
-- Provides Tree-sitter 0.25 for Emacs 29/30 and a project-local Tree-sitter
-  0.27 C runtime for Emacs 31+. Keep the 0.27 runtime on the pinned Nixpkgs
-  25.05 Darwin stdenv: Nixpkgs 25.11 and later default to a macOS 14 deployment
-  target, which would break the bundle's macOS 11.3 compatibility.
+- Provides the Nixpkgs Tree-sitter runtime for Emacs 29/30 and a project-local Tree-sitter
+  0.27 C runtime for Emacs 31+. The toolchain is pinned to Nixpkgs 26.05;
+  dependencies require macOS 14 or later, and the default shell targets macOS 26.
 - Keep the full host Command Line Tools SDK out of the Nix build-time
   `LIBRARY_PATH`; expose only the sanitized system ncurses stub. Nix supplies
   the remaining libraries matched to its linker, while newer host SDK stubs
@@ -97,6 +96,19 @@ Go tests use `_test.go` suffix alongside source files. Ruby specs live in
 
 Keep GitHub Actions dependencies pinned to full commit SHAs with version
 comments. Update and verify them with `pinact run -update`.
+
+## Emacs-IGC Local Builds
+
+`scripts/igc/emacs-igc` builds, verifies, installs, and rolls back
+`/Applications/Emacs-IGC.app` from `emacs-mirror/emacs` `feature/igc3`.
+Treat `Contents/Resources/igc-source-commit.txt` as the installed source commit;
+`emacs-repository-version` reports this repository's HEAD instead.
+
+`.github/workflows/emacs-igc.yml` runs the same `emacs-igc build` and `dmg`
+commands on a `macos-26` runner and publishes `emacs-igc-<sha7>` releases;
+`emacs-igc install <file>.dmg` installs one. Keep the runner's macOS and
+`IGC_NIX_SHELL` aligned, since the build runs the new Emacs. Linux CI agents
+cannot build it.
 
 ## Working Directories
 
